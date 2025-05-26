@@ -14,13 +14,17 @@ from anthropic import APIResponse
 from anthropic.types import TextBlock
 from anthropic.types.beta import BetaMessage, BetaTextBlock, BetaToolUseBlock
 from anthropic.types.tool_use_block import ToolUseBlock
+
 from loop import (
     APIProvider,
     sampling_loop_sync,
 )
+from agent.ppt_agent import PPTAgent 
 from tools import ToolResult
+from tools.computer import ComputerTool # Import ComputerTool
 import requests
 from requests.exceptions import RequestException
+import time # Import time
 import base64
 
 CONFIG_DIR = Path("~/.anthropic").expanduser()
@@ -72,6 +76,10 @@ def setup_state(state):
         state['chatbot_messages'] = []
     if 'stop' not in state:
         state['stop'] = False
+    if 'agent_type' not in state: # To differentiate between VLM and PPT agent
+        state['agent_type'] = "vlm_agent" 
+    if 'ppt_filename' not in state:
+        state['ppt_filename'] = "GeneratedPPT.pptx"
 
 async def main(state):
     """Render loop for Gradio"""
@@ -189,21 +197,28 @@ def chatbot_output_callback(message, chatbot_state, hide_images=False, sender="b
 def valid_params(user_input, state):
     """Validate all requirements and return a list of error messages."""
     errors = []
-    
-    for server_name, url in [('Windows Host', 'localhost:5000'), ('OmniParser Server', args.omniparser_server_url)]:
-        try:
-            url = f'http://{url}/probe'
-            response = requests.get(url, timeout=3)
-            if response.status_code != 200:
+    agent_type = state.get("agent_type", "vlm_agent")
+
+    if agent_type == "vlm_agent":
+        for server_name, url in [('Windows Host', 'localhost:5000'), ('OmniParser Server', args.omniparser_server_url)]:
+            try:
+                url = f'http://{url}/probe'
+                response = requests.get(url, timeout=3)
+                if response.status_code != 200:
+                    errors.append(f"{server_name} is not responding")
+            except RequestException as e:
                 errors.append(f"{server_name} is not responding")
-        except RequestException as e:
-            errors.append(f"{server_name} is not responding")
     
-    if not state["api_key"].strip():
-        errors.append("LLM API Key is not set")
+    # Common validations
+    if not state.get("api_key", "").strip():
+        # API key might not be needed if PPTAgent uses a local/free model, but current PPTAgent needs one for DeepSeek/Groq
+        errors.append("LLM API Key is not set (required for selected model/provider)")
 
     if not user_input:
-        errors.append("no computer use request provided")
+        if agent_type == "ppt_generator":
+            errors.append("PPT Topic is not provided")
+        else: # vlm_agent
+            errors.append("No computer use request provided")
     
     return errors
 
@@ -216,40 +231,192 @@ def process_input(user_input, state):
     if errors:
         raise gr.Error("Validation errors: " + ", ".join(errors))
     
-    # Append the user message to state["messages"]
-    state["messages"].append(
-        {
-            "role": Sender.USER,
-            "content": [TextBlock(type="text", text=user_input)],
-        }
-    )
-
     # Append the user's message to chatbot_messages with None for the assistant's reply
     state['chatbot_messages'].append((user_input, None))
-    yield state['chatbot_messages']  # Yield to update the chatbot UI with the user's message
+    yield state['chatbot_messages']
 
-    print("state")
-    print(state)
+    agent_type = state.get("agent_type", "vlm_agent")
 
-    # Run sampling_loop_sync with the chatbot_output_callback
-    for loop_msg in sampling_loop_sync(
-        model=state["model"],
-        provider=state["provider"],
-        messages=state["messages"],
-        output_callback=partial(chatbot_output_callback, chatbot_state=state['chatbot_messages'], hide_images=False),
-        tool_output_callback=partial(_tool_output_callback, tool_state=state["tools"]),
-        api_response_callback=partial(_api_response_callback, response_state=state["responses"]),
-        api_key=state["api_key"],
-        only_n_most_recent_images=state["only_n_most_recent_images"],
-        max_tokens=16384,
-        omniparser_url=args.omniparser_server_url
-    ):  
-        if loop_msg is None or state.get("stop"):
+    if agent_type == "ppt_generator":
+        chatbot_output_callback(f"PPT Topic Received: {user_input}", state['chatbot_messages'], sender="bot") 
+        yield state['chatbot_messages']
+
+        ppt_agent = PPTAgent(
+            model=state["model"], 
+            provider=state["provider"], 
+            api_key=state["api_key"],
+            output_callback=partial(chatbot_output_callback, chatbot_state=state['chatbot_messages'], sender="bot"),
+            api_response_callback=partial(_api_response_callback, response_state=state["responses"])
+        )
+        
+        ppt_topic = user_input
+        ppt_filename = state.get("ppt_filename", "GeneratedPPT.pptx")
+        
+        chatbot_output_callback(f"Generating PPT content and actions for topic: '{ppt_topic}' (filename: '{ppt_filename}')...", state['chatbot_messages'], sender="bot")
+        yield state['chatbot_messages']
+
+        try:
+            result = ppt_agent.generate_ppt_content_and_actions(topic=ppt_topic, ppt_filename=ppt_filename)
+            generated_slides = result.get("generated_slides", [])
+            powerpoint_actions = result.get("powerpoint_actions", [])
+
+            summary_message = f"PPT Content Generation Complete:\nGenerated {len(generated_slides)} slides.\n"
+            # for i, slide in enumerate(generated_slides):
+            #     summary_message += f"  Slide {i+1}: {slide.get('title', 'No Title')}\n"
+            summary_message += f"Found {len(powerpoint_actions)} PowerPoint creation actions. Starting execution..."
+            chatbot_output_callback(summary_message, state['chatbot_messages'], sender="bot")
             yield state['chatbot_messages']
-            print("End of task. Close the loop.")
-            break
-            
-        yield state['chatbot_messages']  # Yield the updated chatbot_messages to update the chatbot UI
+
+            # Initialize ComputerTool
+            # The 'messages' state for ComputerTool might need careful handling if PPTAgent modifies it.
+            # For now, we pass the main state["messages"], which might have the initial user prompt.
+            computer_tool = ComputerTool(
+                output_callback=partial(chatbot_output_callback, chatbot_state=state['chatbot_messages'], sender="tool_raw_output"), # For raw output from tool if any
+                omniparser_url=args.omniparser_server_url,
+                messages=state["messages"] # Pass messages for context if ComputerTool uses it
+            )
+
+            for action_step in powerpoint_actions:
+                if state.get("stop"):
+                    chatbot_output_callback("PPT Action execution stopped by user.", state['chatbot_messages'], sender="bot_info")
+                    yield state['chatbot_messages']
+                    break
+                
+                action_type_display = action_step.get('action_type', 'Unknown Action')
+                action_details_display = ""
+                if action_type_display == "TYPE_TEXT":
+                    action_details_display = f" (Placeholder: {action_step.get('target_placeholder', '')}, Text: {action_step.get('text', '')[:30]}...)"
+                
+                chatbot_output_callback(f"Executing planned action: {action_type_display}{action_details_display}", state['chatbot_messages'], sender="bot_info")
+                yield state['chatbot_messages']
+
+                # Screen Capture
+                parsed_screen_result = None
+                try:
+                    parsed_screen_result = computer_tool.capture_screen_uri_and_elements_v2()
+                    if not parsed_screen_result or parsed_screen_result.get("error"):
+                        raise Exception(parsed_screen_result.get('error', 'Unknown screen capture error'))
+                    # Display screenshot in chat - ComputerTool's capture_screen_uri_and_elements_v2 already does this via its output_callback
+                    # For example: chatbot_output_callback(ToolResult(tool_id="screen_capture", base64_image=parsed_screen_result.get('screenshot_base64')), state['chatbot_messages'], sender="tool_result")
+                    # yield state['chatbot_messages']
+                except Exception as e:
+                    chatbot_output_callback(f"Error capturing screen: {str(e)}", state['chatbot_messages'], sender="bot_error")
+                    yield state['chatbot_messages']
+                    continue # Skip to next action or break
+
+                # Get Executable Action from PPTAgent
+                beta_message: Optional[BetaMessage] = None
+                vlm_response_json: Optional[Dict] = None
+                try:
+                    beta_message, vlm_response_json = ppt_agent.get_next_executable_action(action_step, parsed_screen_result)
+                except Exception as e:
+                    chatbot_output_callback(f"Error in get_next_executable_action: {str(e)}", state['chatbot_messages'], sender="bot_error")
+                    yield state['chatbot_messages']
+                    continue
+
+                # Handle Meta-Actions or errors from get_next_executable_action
+                if beta_message is None:
+                    status = vlm_response_json.get("status") if vlm_response_json else "unknown_error"
+                    details = vlm_response_json.get("details", {}) if vlm_response_json else {}
+                    
+                    if status == "meta_action":
+                        meta_action_type = details.get('action_type', 'UNKNOWN_META_ACTION')
+                        chatbot_output_callback(f"Meta action: {meta_action_type}. Details: {details}. Attempting direct handling.", state['chatbot_messages'], sender="bot_info")
+                        yield state['chatbot_messages']
+                        try:
+                            if meta_action_type == "OPEN_APPLICATION":
+                                computer_tool.open_application(details.get("application_name", "PowerPoint"))
+                                chatbot_output_callback(f"Opened {details.get('application_name', 'PowerPoint')}", state['chatbot_messages'], sender="tool_result")
+                            elif meta_action_type == "CLOSE_APPLICATION":
+                                computer_tool.close_application(details.get("application_name", "PowerPoint"))
+                                chatbot_output_callback(f"Closed {details.get('application_name', 'PowerPoint')}", state['chatbot_messages'], sender="tool_result")
+                            # SAVE_PRESENTATION and CREATE_NEW_PRESENTATION are more complex UI tasks,
+                            # get_next_executable_action should ideally convert them to VLM-guided steps.
+                            # If they still arrive here as meta_actions, it means they need more specific UI sequences.
+                            elif meta_action_type in ["SAVE_PRESENTATION", "CREATE_NEW_PRESENTATION"]:
+                                chatbot_output_callback(f"Meta action '{meta_action_type}' requires complex UI interaction not yet fully implemented as direct call. It should be broken down by VLM.", state['chatbot_messages'], sender="bot_warning")
+
+                            time.sleep(3) # Give time for app to open/close
+                        except Exception as e:
+                            chatbot_output_callback(f"Error handling meta action {meta_action_type}: {str(e)}", state['chatbot_messages'], sender="bot_error")
+                        yield state['chatbot_messages']
+                        continue
+                    else:
+                        error_msg = vlm_response_json.get('error', 'No BetaMessage returned and not a meta_action') if vlm_response_json else 'Agent failed to produce BetaMessage'
+                        chatbot_output_callback(f"Could not determine executable action: {error_msg}", state['chatbot_messages'], sender="bot_error")
+                        yield state['chatbot_messages']
+                        continue
+                
+                # Execute BetaMessage
+                if beta_message:
+                    reasoning = next((c.text for c in beta_message.content if isinstance(c, BetaTextBlock)), "No reasoning provided.")
+                    chatbot_output_callback(f"VLM Reasoning: {reasoning}", state['chatbot_messages'], sender="bot_info")
+                    yield state['chatbot_messages']
+                    
+                    has_executed_tool_in_betamsg = False
+                    for content_block in beta_message.content:
+                        if isinstance(content_block, BetaToolUseBlock):
+                            has_executed_tool_in_betamsg = True
+                            chatbot_output_callback(f"Attempting to execute tool: {content_block.name}, Input: {content_block.input}", state['chatbot_messages'], sender="bot_info")
+                            yield state['chatbot_messages']
+                            try:
+                                tool_result: ToolResult = computer_tool.execute_tool(tool_use_block=content_block, messages=state["messages"])
+                            except Exception as e:
+                                tool_result = ToolResult(tool_id=content_block.id, error=f"FATAL: Tool execution failed: {str(e)}") # Ensure tool_id is populated
+                            
+                            chatbot_output_callback(tool_result, state['chatbot_messages'], sender="tool_result") # Assuming callback can handle ToolResult
+                            yield state['chatbot_messages']
+                            if tool_result.error:
+                                chatbot_output_callback(f"Error executing tool {content_block.name}: {tool_result.error}", state['chatbot_messages'], sender="bot_error")
+                                yield state['chatbot_messages']
+                                break # Stop processing this BetaMessage if a tool fails
+                    
+                    if not has_executed_tool_in_betamsg:
+                        chatbot_output_callback("No tool use block found in BetaMessage to execute.", state['chatbot_messages'], sender="bot_warning")
+                        yield state['chatbot_messages']
+
+                time.sleep(2) # Delay between high-level actions
+
+            chatbot_output_callback("PowerPoint action sequence processing complete.", state['chatbot_messages'], sender="bot")
+            yield state['chatbot_messages']
+
+        except Exception as e:
+            error_msg = f"Error during PPT processing or execution: {str(e)}"
+            chatbot_output_callback(error_msg, state['chatbot_messages'], sender="bot_error")
+            yield state['chatbot_messages']
+
+    elif agent_type == "vlm_agent":
+        # Append the user message to state["messages"] for VLM agent
+        state["messages"].append(
+            {
+                "role": Sender.USER,
+                "content": [TextBlock(type="text", text=user_input)],
+            }
+        )
+        print("VLM Agent State:")
+        print(state)
+        # Run sampling_loop_sync with the chatbot_output_callback
+        for loop_msg in sampling_loop_sync(
+            model=state["model"],
+            provider=state["provider"],
+            messages=state["messages"],
+            output_callback=partial(chatbot_output_callback, chatbot_state=state['chatbot_messages'], hide_images=False),
+            tool_output_callback=partial(_tool_output_callback, tool_state=state["tools"]),
+            api_response_callback=partial(_api_response_callback, response_state=state["responses"]),
+            api_key=state["api_key"],
+            only_n_most_recent_images=state["only_n_most_recent_images"],
+            max_tokens=16384,
+            omniparser_url=args.omniparser_server_url
+        ):  
+            if loop_msg is None or state.get("stop"):
+                yield state['chatbot_messages']
+                print("End of task. Close the loop.")
+                break
+                
+            yield state['chatbot_messages']
+    else:
+        chatbot_output_callback(f"Error: Unknown agent type '{agent_type}'.", state['chatbot_messages'], sender="bot_error")
+        yield state['chatbot_messages']
 
 def stop_app(state):
     state["stop"] = True
